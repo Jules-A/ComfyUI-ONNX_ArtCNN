@@ -1,5 +1,6 @@
 import os
-from typing import Dict
+import math
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
@@ -12,6 +13,7 @@ class ArtCNNONNXError(RuntimeError):
 
 
 _SESSION_CACHE: Dict[str, ort.InferenceSession] = {}
+_SESSION_INFO_CACHE: Dict[str, Tuple] = {}
 
 
 def _onnx_folder() -> str:
@@ -23,21 +25,28 @@ def _onnx_folder() -> str:
 def _list_models(include_none=False):
     folder = _onnx_folder()
     os.makedirs(folder, exist_ok=True)
+
     models = sorted(
-        f for f in os.listdir(folder)
-        if f.lower().endswith(".onnx") and os.path.isfile(os.path.join(folder, f))
+        f
+        for f in os.listdir(folder)
+        if f.lower().endswith(".onnx")
+        and os.path.isfile(os.path.join(folder, f))
     )
+
     if include_none:
         return ["None"] + models
+
     return models or ["<no .onnx models found>"]
 
 
 def _get_session(path: str):
     key = os.path.abspath(path)
+
     if key in _SESSION_CACHE:
         return _SESSION_CACHE[key]
 
     available = ort.get_available_providers()
+
     if "DmlExecutionProvider" not in available:
         raise ArtCNNONNXError(
             "onnxruntime-directml is required for this node. "
@@ -45,8 +54,12 @@ def _get_session(path: str):
         )
 
     so = ort.SessionOptions()
+
+    # Keep the proven original execution configuration.
+    # Do not force alternate memory or graph settings here.
     so.enable_mem_pattern = False
     so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
     session = ort.InferenceSession(
         key,
         sess_options=so,
@@ -54,187 +67,406 @@ def _get_session(path: str):
     )
 
     active = session.get_providers()
+
     if not active or active[0] != "DmlExecutionProvider":
         raise ArtCNNONNXError(
             "DirectML was requested but is not the active execution provider. "
             f"Session providers: {active}"
         )
 
+    inp = session.get_inputs()[0]
+    out = session.get_outputs()[0]
+
     _SESSION_CACHE[key] = session
+    _SESSION_INFO_CACHE[key] = (
+        inp.name,
+        inp.type,
+        inp.shape,
+        out.name,
+        out.type,
+        out.shape,
+    )
+
     return session
 
 
-def _shape_dim_is_int(v):
-    return isinstance(v, (int, np.integer))
+def _session_info(session):
+    for path, cached_session in _SESSION_CACHE.items():
+        if cached_session is session:
+            return _SESSION_INFO_CACHE[path]
+
+    inp = session.get_inputs()[0]
+    out = session.get_outputs()[0]
+
+    return (
+        inp.name,
+        inp.type,
+        inp.shape,
+        out.name,
+        out.type,
+        out.shape,
+    )
+
+
+def _shape_dim_is_int(value):
+    return isinstance(value, (int, np.integer))
 
 
 def _model_io_channels(session):
-    inp = session.get_inputs()[0]
-    out = session.get_outputs()[0]
-    if len(inp.shape) != 4 or len(out.shape) != 4:
-        raise ArtCNNONNXError(
-            f"ArtCNN model must have 4D input/output, got input={inp.shape}, output={out.shape}"
-        )
-    in_ch = inp.shape[1] if _shape_dim_is_int(inp.shape[1]) else None
-    out_ch = out.shape[1] if _shape_dim_is_int(out.shape[1]) else None
-    if in_ch is None or out_ch is None:
-        raise ArtCNNONNXError(
-            f"Channel dimensions must be static for this node, got input={inp.shape}, output={out.shape}"
-        )
-    return int(in_ch), int(out_ch)
+    _, _, input_shape, _, _, output_shape = _session_info(session)
 
-
-def _validate_luma(session):
-    in_ch, out_ch = _model_io_channels(session)
-    if in_ch != 1 or out_ch != 1:
+    if len(input_shape) != 4 or len(output_shape) != 4:
         raise ArtCNNONNXError(
-            f"Selected model is not a 1->1 luma model: input={in_ch} channels, output={out_ch} channels"
+            "ArtCNN model must have 4D input/output, "
+            f"got input={input_shape}, output={output_shape}"
         )
 
+    input_channels = (
+        input_shape[1]
+        if _shape_dim_is_int(input_shape[1])
+        else None
+    )
+    output_channels = (
+        output_shape[1]
+        if _shape_dim_is_int(output_shape[1])
+        else None
+    )
 
-def _validate_rgb(session):
-    in_ch, out_ch = _model_io_channels(session)
-    if in_ch != 3 or out_ch != 3:
+    if input_channels is None or output_channels is None:
         raise ArtCNNONNXError(
-            f"Selected model is not a 3->3 RGB model: input={in_ch} channels, output={out_ch} channels"
+            "Channel dimensions must be static for this node, "
+            f"got input={input_shape}, output={output_shape}"
         )
 
-def _validate_chroma(session):
-    inp = session.get_inputs()[0]
-    out = session.get_outputs()[0]
-    if len(inp.shape) != 4 or len(out.shape) != 4:
+    return int(input_channels), int(output_channels)
+
+
+def _validate_luma_model(session):
+    input_channels, output_channels = _model_io_channels(session)
+
+    if input_channels != 1 or output_channels != 1:
         raise ArtCNNONNXError(
-            f"Chroma model must be 4D input/output, got input={inp.shape}, output={out.shape}"
-        )
-    if _shape_dim_is_int(inp.shape[1]) and inp.shape[1] != 3:
-        raise ArtCNNONNXError(
-            f"This ArtCNN chroma path expects a 3-channel Y/Cb/Cr input model, got {inp.shape}"
-        )
-    if _shape_dim_is_int(out.shape[1]) and out.shape[1] != 2:
-        raise ArtCNNONNXError(
-            f"This ArtCNN chroma path expects 2-channel Cb/Cr output, got {out.shape}"
+            "Selected model is not a 1->1 luma model: "
+            f"input={input_channels} channels, "
+            f"output={output_channels} channels"
         )
 
 
-def _run_fixed_batch(session, x: np.ndarray) -> np.ndarray:
-    if x.ndim != 4:
-        raise ArtCNNONNXError(f"Expected NCHW input, got {x.shape}")
-    inp = session.get_inputs()[0]
-    static_batch = inp.shape[0]
-    if _shape_dim_is_int(static_batch) and static_batch == 1 and x.shape[0] != 1:
-        outs = []
-        for i in range(x.shape[0]):
-            outs.append(np.asarray(session.run(None, {inp.name: x[i:i + 1]})[0], dtype=np.float32))
-        return np.concatenate(outs, axis=0)
-    return np.asarray(session.run(None, {inp.name: x})[0], dtype=np.float32)
+def _validate_chroma_model(session):
+    _, _, input_shape, _, _, output_shape = _session_info(session)
+
+    if len(input_shape) != 4 or len(output_shape) != 4:
+        raise ArtCNNONNXError(
+            "Chroma model must be 4D input/output, "
+            f"got input={input_shape}, output={output_shape}"
+        )
+
+    if (
+        _shape_dim_is_int(input_shape[1])
+        and input_shape[1] != 3
+    ):
+        raise ArtCNNONNXError(
+            "The chroma path expects a 3-channel Y/Cb/Cr input model, "
+            f"got {input_shape}"
+        )
+
+    if (
+        _shape_dim_is_int(output_shape[1])
+        and output_shape[1] != 2
+    ):
+        raise ArtCNNONNXError(
+            "The chroma path expects a 2-channel Cb/Cr output model, "
+            f"got {output_shape}"
+        )
 
 
-def _run_luma(session, y: np.ndarray) -> np.ndarray:
-    out = _run_fixed_batch(session, y)
-    if out.ndim != 4 or out.shape[1] != 1:
-        raise ArtCNNONNXError(f"Unexpected luma output shape: {out.shape}")
-    return out
+def _prepare_onnx_input(session, array: np.ndarray) -> np.ndarray:
+    """
+    Match the ONNX model's declared floating-point input type.
+
+    FP32 model -> FP32 input
+    FP16 model -> FP16 input
+    """
+    _, input_type, _, _, _, _ = _session_info(session)
+
+    if input_type == "tensor(float16)":
+        return array.astype(np.float16, copy=False)
+
+    if input_type == "tensor(float)":
+        return array.astype(np.float32, copy=False)
+
+    raise ArtCNNONNXError(
+        f"Unsupported ONNX input type: {input_type}. "
+        "This node supports tensor(float) and tensor(float16)."
+    )
 
 
-def _run_chroma(session, ycbcr: np.ndarray) -> np.ndarray:
-    out = _run_fixed_batch(session, ycbcr)
-    if out.ndim != 4 or out.shape[1] != 2:
-        raise ArtCNNONNXError(f"Unexpected chroma output shape: {out.shape}")
-    return out
+def _normalize_onnx_output(output: np.ndarray) -> np.ndarray:
+    if output.dtype != np.float32:
+        return output.astype(np.float32, copy=False)
+
+    return output
 
 
-def _rgb_to_ycbcr(rgb: torch.Tensor):
-    # Full-range BT.709 YCbCr, all channels normalized to [0, 1].
-    kr, kb = 0.2126, 0.0722
-    kg = 1.0 - kr - kb
-    r, g, b = rgb[:, 0:1], rgb[:, 1:2], rgb[:, 2:3]
-    y = kr * r + kg * g + kb * b
-    cb = (b - y) / (2.0 * (1.0 - kb)) + 0.5
-    cr = (r - y) / (2.0 * (1.0 - kr)) + 0.5
-    return torch.cat((y, cb, cr), dim=1)
+def _run_fixed_batch(session, array: np.ndarray) -> np.ndarray:
+    if array.ndim != 4:
+        raise ArtCNNONNXError(
+            f"Expected NCHW input, got {array.shape}"
+        )
+
+    input_name, _, input_shape, _, _, _ = _session_info(session)
+    static_batch = input_shape[0]
+
+    array = _prepare_onnx_input(session, array)
+
+    if (
+        _shape_dim_is_int(static_batch)
+        and static_batch == 1
+        and array.shape[0] != 1
+    ):
+        outputs = []
+
+        for index in range(array.shape[0]):
+            output = session.run(
+                None,
+                {input_name: array[index:index + 1]},
+            )[0]
+
+            outputs.append(
+                _normalize_onnx_output(output)
+            )
+
+        return np.concatenate(outputs, axis=0)
+
+    output = session.run(
+        None,
+        {input_name: array},
+    )[0]
+
+    return _normalize_onnx_output(output)
 
 
-def _ycbcr_to_rgb(ycbcr: torch.Tensor):
-    kr, kb = 0.2126, 0.0722
-    kg = 1.0 - kr - kb
-    y, cb, cr = ycbcr[:, 0:1], ycbcr[:, 1:2], ycbcr[:, 2:3]
-    r = y + 2.0 * (1.0 - kr) * (cr - 0.5)
-    b = y + 2.0 * (1.0 - kb) * (cb - 0.5)
-    g = (y - kr * r - kb * b) / kg
-    return torch.cat((r, g, b), dim=1).clamp(0, 1)
+def _run_primary_model(session, array: np.ndarray) -> np.ndarray:
+    output = _run_fixed_batch(session, array)
+
+    if output.ndim != 4:
+        raise ArtCNNONNXError(
+            f"Unexpected primary model output shape: {output.shape}"
+        )
+
+    return output
+
+
+def _run_chroma_model(session, array: np.ndarray) -> np.ndarray:
+    output = _run_fixed_batch(session, array)
+
+    if output.ndim != 4 or output.shape[1] != 2:
+        raise ArtCNNONNXError(
+            f"Unexpected chroma output shape: {output.shape}"
+        )
+
+    return output
+
+
+# -------------------------------------------------------------------------
+# BT.709 conversion used by the luma/chroma pipeline.
+#
+# RGB 3->3 models bypass this completely.
+# -------------------------------------------------------------------------
+
+
+def _rgb_to_ycbcr(rgb: torch.Tensor) -> torch.Tensor:
+    rgb = rgb.clamp(0, 1)
+
+    r = rgb[:, 0:1]
+    g = rgb[:, 1:2]
+    b = rgb[:, 2:3]
+
+    y = (
+        0.2126 * r
+        + 0.7152 * g
+        + 0.0722 * b
+    )
+
+    cb = (
+        -0.114572 * r
+        - 0.385428 * g
+        + 0.5 * b
+        + 0.5
+    )
+
+    cr = (
+        0.5 * r
+        - 0.454153 * g
+        - 0.045847 * b
+        + 0.5
+    )
+
+    return torch.cat(
+        (y, cb, cr),
+        dim=1,
+    ).clamp(0, 1)
+
+
+def _ycbcr_to_rgb(ycbcr: torch.Tensor) -> torch.Tensor:
+    ycbcr = ycbcr.clamp(0, 1)
+
+    y = ycbcr[:, 0:1]
+    cb = ycbcr[:, 1:2] - 0.5
+    cr = ycbcr[:, 2:3] - 0.5
+
+    r = y + 1.5748 * cr
+    g = y - 0.1873 * cb - 0.4681 * cr
+    b = y + 1.8556 * cb
+
+    return torch.cat(
+        (r, g, b),
+        dim=1,
+    ).clamp(0, 1)
+
+
+# -------------------------------------------------------------------------
+# Chroma resampling
+# -------------------------------------------------------------------------
+
+
+def _sinc(x):
+    if x == 0.0:
+        return 1.0
+
+    pix = math.pi * x
+    return math.sin(pix) / pix
 
 
 def _filter_kernel(x, kind):
-    # Kernels are defined in source-pixel coordinates.  The resize is only
-    # used for upscaling here, so no anti-aliasing shrink of the kernel is needed.
     if kind == "bilinear":
         ax = abs(x)
         return max(0.0, 1.0 - ax)
 
     if kind == "catmull-rom":
-        # Cubic convolution with a=-0.5 (Catmull-Rom). Sharper than Mitchell
-        # without the broader support/ringing of Lanczos.
         ax = abs(x)
+
         if ax < 1.0:
             return 1.5 * ax**3 - 2.5 * ax**2 + 1.0
+
         if ax < 2.0:
             return -0.5 * ax**3 + 2.5 * ax**2 - 4.0 * ax + 2.0
+
         return 0.0
 
     if kind == "mitchell":
-        # Mitchell-Netravali, B=C=1/3.
         B = C = 1.0 / 3.0
         ax = abs(x)
+
         if ax < 1.0:
-            return ((12 - 9*B - 6*C)*ax**3 + (-18 + 12*B + 6*C)*ax**2 + (6 - 2*B)) / 6.0
+            return (
+                (12 - 9 * B - 6 * C) * ax**3
+                + (-18 + 12 * B + 6 * C) * ax**2
+                + (6 - 2 * B)
+            ) / 6.0
+
         if ax < 2.0:
-            return ((-B - 6*C)*ax**3 + (6*B + 30*C)*ax**2 + (-12*B - 48*C)*ax + (8*B + 24*C)) / 6.0
+            return (
+                (-B - 6 * C) * ax**3
+                + (6 * B + 30 * C) * ax**2
+                + (-12 * B - 48 * C) * ax
+                + (8 * B + 24 * C)
+            ) / 6.0
+
         return 0.0
 
     if kind == "lanczos":
-        if x == 0.0:
-            return 1.0
-        ax = abs(x)
-        if ax >= 3.0:
+        if abs(x) >= 3.0:
             return 0.0
-        import math
-        pix = math.pi * x
-        pix3 = pix / 3.0
-        return (math.sin(pix) / pix) * (math.sin(pix3) / pix3)
 
-    raise ArtCNNONNXError(f"Unknown chroma resampler: {kind}")
+        return _sinc(x) * _sinc(x / 3.0)
+
+    if kind == "lanczos2":
+        if abs(x) >= 2.0:
+            return 0.0
+
+        return _sinc(x) * _sinc(x / 2.0)
+
+    if kind == "lanczos2-sharp":
+        blur = 0.9549963639785485
+        radius = 2.0 * blur
+
+        if abs(x) >= radius:
+            return 0.0
+
+        return _sinc(x / blur) * _sinc(x / radius)
+
+    raise ArtCNNONNXError(
+        f"Unknown chroma resampler: {kind}"
+    )
 
 
-def _resize_axis_np(arr, out_len, axis, kind):
-    # Proper pixel-center mapping for separable reconstruction filtering.
-    # Vectorized over all batch/channel/spatial dimensions other than axis.
-    import math
-    in_len = int(arr.shape[axis])
-    out_len = int(out_len)
-    if in_len == out_len:
-        return arr.astype(np.float32, copy=False)
+def _normalize_resampler(kind: str) -> str:
+    return kind.strip().lower().replace(" ", "-")
+
+
+def _resize_axis_np(
+    array,
+    output_length,
+    axis,
+    kind,
+    anti_ring=0.0,
+):
+    input_length = int(array.shape[axis])
+    output_length = int(output_length)
+
+    if input_length == output_length:
+        return array.astype(np.float32, copy=False)
 
     radius = {
         "bilinear": 1.0,
         "catmull-rom": 2.0,
         "mitchell": 2.0,
         "lanczos": 3.0,
+        "lanczos2": 2.0,
+        "lanczos2-sharp": 2.0 * 0.9549963639785485,
     }[kind]
 
-    scale = out_len / in_len
-    coords = (np.arange(out_len, dtype=np.float64) + 0.5) / scale - 0.5
-    first = np.floor(coords - radius + 1.0).astype(np.int64)
+    scale = output_length / input_length
+
+    coords = (
+        (np.arange(output_length, dtype=np.float64) + 0.5) / scale
+        - 0.5
+    )
+
+    first = np.floor(
+        coords - radius + 1.0
+    ).astype(np.int64)
+
     taps = int(math.ceil(radius * 2.0))
-    raw_idx = first[:, None] + np.arange(taps, dtype=np.int64)[None, :]
-    idx = np.clip(raw_idx, 0, in_len - 1)
 
-    dist = coords[:, None] - raw_idx.astype(np.float64)
-    vector_kernel = np.vectorize(lambda d: _filter_kernel(float(d), kind), otypes=[np.float64])
-    weights = vector_kernel(dist)
+    raw_indices = (
+        first[:, None]
+        + np.arange(taps, dtype=np.int64)[None, :]
+    )
 
-    # Boundary clamping duplicates the edge samples. Re-normalize every output
-    # position so edge pixels retain unit DC gain and do not darken/brighten.
+    indices = np.clip(
+        raw_indices,
+        0,
+        input_length - 1,
+    )
+
+    distances = (
+        coords[:, None]
+        - raw_indices.astype(np.float64)
+    )
+
+    vector_kernel = np.vectorize(
+        lambda distance: _filter_kernel(
+            float(distance),
+            kind,
+        ),
+        otypes=[np.float64],
+    )
+
+    weights = vector_kernel(distances)
     weights_sum = weights.sum(axis=1, keepdims=True)
+
     weights = np.divide(
         weights,
         weights_sum,
@@ -242,37 +474,110 @@ def _resize_axis_np(arr, out_len, axis, kind):
         where=np.abs(weights_sum) > 1e-15,
     ).astype(np.float32)
 
-    moved = np.moveaxis(arr, axis, -1)
-    flat = moved.reshape(-1, in_len)
-    gathered = flat[:, idx]                  # [N, out_len, taps]
-    out = np.sum(gathered * weights[None, :, :], axis=-1)
-    out = out.reshape(moved.shape[:-1] + (out_len,))
-    return np.moveaxis(out, -1, axis).astype(np.float32, copy=False)
+    moved = np.moveaxis(array, axis, -1)
+    flat = moved.reshape(-1, input_length)
+    gathered = flat[:, indices]
+
+    output = np.sum(
+        gathered * weights[None, :, :],
+        axis=-1,
+    )
+
+    if anti_ring > 0.0:
+        local_min = gathered.min(axis=-1)
+        local_max = gathered.max(axis=-1)
+        limited = np.clip(output, local_min, local_max)
+        output += (limited - output) * anti_ring
+
+    output = output.reshape(
+        moved.shape[:-1] + (output_length,)
+    )
+
+    return np.moveaxis(
+        output,
+        -1,
+        axis,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
 
 
-def _resize_chroma(chroma: torch.Tensor, size, kind: str) -> torch.Tensor:
-    kind = kind.lower()
+def _resize_chroma(
+    chroma: torch.Tensor,
+    size,
+    kind: str,
+) -> torch.Tensor:
+    kind = _normalize_resampler(kind)
+
     if kind == "bilinear":
-        return F.interpolate(chroma, size=size, mode="bilinear", align_corners=False)
+        return F.interpolate(
+            chroma,
+            size=size,
+            mode="bilinear",
+            align_corners=False,
+        )
 
-    # Mitchell/Catmull-Rom/Lanczos are deliberately kept as deterministic CPU
-    # reconstruction filters. Chroma is only 2 channels, so this remains much
-    # cheaper than filtering the full RGB image.
-    arr = chroma.detach().cpu().numpy().astype(np.float32, copy=False)
-    arr = _resize_axis_np(arr, size[0], axis=2, kind=kind)
-    arr = _resize_axis_np(arr, size[1], axis=3, kind=kind)
-    return torch.from_numpy(arr)
+    anti_ring_total = 0.22 if kind == "lanczos2-sharp" else 0.0
+
+    anti_ring_pass = (
+        1.0 - math.sqrt(1.0 - anti_ring_total)
+        if anti_ring_total > 0.0
+        else 0.0
+    )
+
+    array = (
+        chroma.detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False)
+    )
+
+    array = _resize_axis_np(
+        array,
+        size[0],
+        axis=2,
+        kind=kind,
+        anti_ring=anti_ring_pass,
+    )
+
+    array = _resize_axis_np(
+        array,
+        size[1],
+        axis=3,
+        kind=kind,
+        anti_ring=anti_ring_pass,
+    )
+
+    return torch.from_numpy(array)
 
 
-class ArtCNNLumaUpscaleONNX:
+# -------------------------------------------------------------------------
+# ComfyUI node
+# -------------------------------------------------------------------------
+
+
+class ArtCNNUpscaleONNX:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
                 "model": (_list_models(),),
-                "chroma_model": (_list_models(include_none=True),),
-                "chroma_resampler": (["Catmull-Rom", "Mitchell", "Lanczos", "Bilinear"], {"default": "Catmull-Rom"}),
+                "chroma_model": (
+                    _list_models(include_none=True),
+                ),
+                "chroma_resampler": (
+                    [
+                        "Catmull-Rom",
+                        "Mitchell",
+                        "Lanczos",
+                        "Lanczos2",
+                        "Lanczos2 Sharp",
+                        "Bilinear",
+                    ],
+                    {"default": "Catmull-Rom"},
+                ),
             },
         }
 
@@ -280,166 +585,315 @@ class ArtCNNLumaUpscaleONNX:
     FUNCTION = "upscale"
     CATEGORY = "image/upscaling"
     DESCRIPTION = (
-        "ArtCNN ONNX luma upscaler with optional ArtCNN chroma reconstruction. "
-        "GPU-only DirectML; no CPU fallback."
+        "ArtCNN ONNX upscaler with RGB, luma, and optional "
+        "chroma reconstruction using DirectML."
     )
 
-    def upscale(self, image, model, chroma_model, chroma_resampler="Mitchell"):
+    def upscale(
+        self,
+        image,
+        model,
+        chroma_model,
+        chroma_resampler="Catmull-Rom",
+    ):
         if model.startswith("<no "):
-            raise ArtCNNONNXError(f"No ONNX models found in {_onnx_folder()}")
+            raise ArtCNNONNXError(
+                f"No ONNX models found in {_onnx_folder()}"
+            )
 
-        luma_path = os.path.join(_onnx_folder(), model)
-        if not os.path.isfile(luma_path):
-            raise ArtCNNONNXError(f"Luma ONNX model not found: {luma_path}")
+        model_path = os.path.join(
+            _onnx_folder(),
+            model,
+        )
 
-        luma_session = _get_session(luma_path)
-        luma_in_ch, luma_out_ch = _model_io_channels(luma_session)
+        if not os.path.isfile(model_path):
+            raise ArtCNNONNXError(
+                f"Model not found: {model_path}"
+            )
+
+        model_session = _get_session(model_path)
+        model_input_channels, model_output_channels = _model_io_channels(
+            model_session
+        )
 
         chroma_session = None
+
         if chroma_model != "None":
-            chroma_path = os.path.join(_onnx_folder(), chroma_model)
+            chroma_path = os.path.join(
+                _onnx_folder(),
+                chroma_model,
+            )
+
             if not os.path.isfile(chroma_path):
-                raise ArtCNNONNXError(f"Chroma ONNX model not found: {chroma_path}")
-            if os.path.abspath(chroma_path) == os.path.abspath(luma_path):
-                raise ArtCNNONNXError("Luma and chroma models must be different files.")
+                raise ArtCNNONNXError(
+                    f"Chroma model not found: {chroma_path}"
+                )
+
+            if os.path.abspath(chroma_path) == os.path.abspath(model_path):
+                raise ArtCNNONNXError(
+                    "Primary and chroma models must be different files."
+                )
+
             chroma_session = _get_session(chroma_path)
-            _validate_chroma(chroma_session)
+            _validate_chroma_model(chroma_session)
 
         if image.ndim != 4 or image.shape[-1] not in (1, 3, 4):
             raise ArtCNNONNXError(
-                f"Expected IMAGE tensor [B,H,W,1/3/4], got {tuple(image.shape)}"
+                "Expected IMAGE tensor [B,H,W,1/3/4], "
+                f"got {tuple(image.shape)}"
             )
 
-        x = image.detach().float().clamp(0, 1)
-        channels = x.shape[-1]
-        if channels == 4:
-            rgb = x[..., :3]
-            alpha = x[..., 3:4]
-        elif channels == 3:
-            rgb = x
+        image = image.detach().float().clamp(0, 1)
+
+        if image.shape[-1] == 4:
+            rgb = image[..., :3]
+            alpha = image[..., 3:4]
+        elif image.shape[-1] == 3:
+            rgb = image
             alpha = None
         else:
-            rgb = x.repeat(1, 1, 1, 3)
+            rgb = image.repeat(1, 1, 1, 3)
             alpha = None
 
         rgb_nchw = rgb.permute(0, 3, 1, 2).contiguous()
 
-        # Native RGB ArtCNN model (e.g. R16F128_RGB): run RGB directly.
-        if luma_in_ch == 3 and luma_out_ch == 3:
+        # -----------------------------------------------------------------
+        # RGB 3 -> 3
+        # -----------------------------------------------------------------
+
+        if (
+            model_input_channels == 3
+            and model_output_channels == 3
+        ):
             if chroma_session is not None:
                 raise ArtCNNONNXError(
-                    "A 3->3 RGB ArtCNN model already processes RGB directly; "
+                    "A 3->3 RGB model already processes RGB directly; "
                     "do not select a separate chroma model."
                 )
-            rgb_np = rgb_nchw.cpu().numpy().astype(np.float32, copy=False)
-            rgb2_np = _run_fixed_batch(luma_session, rgb_np)
-            if rgb2_np.ndim != 4 or rgb2_np.shape[1] != 3:
-                raise ArtCNNONNXError(f"Unexpected RGB ArtCNN output shape: {rgb2_np.shape}")
-            out_h, out_w = rgb2_np.shape[-2:]
-            in_h, in_w = rgb_nchw.shape[-2:]
-            scale_h = out_h / max(in_h, 1)
-            scale_w = out_w / max(in_w, 1)
-            if abs(scale_h - scale_w) > 1e-6:
+
+            rgb_np = (
+                rgb_nchw.cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
+
+            rgb_output_np = _run_primary_model(
+                model_session,
+                rgb_np,
+            )
+
+            if (
+                rgb_output_np.ndim != 4
+                or rgb_output_np.shape[1] != 3
+            ):
                 raise ArtCNNONNXError(
-                    "RGB ArtCNN model produced a non-uniform scale: "
-                    f"Input={in_h}x{in_w}, output={out_h}x{out_w} "
-                    f"({scale_w:.3f}x{scale_h:.3f})"
+                    "Unexpected RGB model output shape: "
+                    f"{rgb_output_np.shape}"
                 )
-            if min(abs(scale_w - 2.0), abs(scale_w - 4.0)) > 1e-6:
+
+            output_height, output_width = rgb_output_np.shape[-2:]
+            input_height, input_width = rgb_nchw.shape[-2:]
+
+            scale_height = output_height / max(input_height, 1)
+            scale_width = output_width / max(input_width, 1)
+
+            if abs(scale_height - scale_width) > 1e-6:
+                raise ArtCNNONNXError(
+                    "RGB model produced a non-uniform scale: "
+                    f"input={input_height}x{input_width}, "
+                    f"output={output_height}x{output_width}"
+                )
+
+            if min(
+                abs(scale_width - 2.0),
+                abs(scale_width - 4.0),
+            ) > 1e-6:
                 raise ArtCNNONNXError(
                     "This node supports 2x and 4x RGB ArtCNN models. "
-                    f"Input={in_h}x{in_w}, output={out_h}x{out_w} "
-                    f"({scale_w:.3f}x{scale_h:.3f})"
+                    f"Input={input_height}x{input_width}, "
+                    f"output={output_height}x{output_width} "
+                    f"({scale_width:.3f}x)"
                 )
-            out = torch.from_numpy(rgb2_np).clamp(0, 1).permute(0, 2, 3, 1).contiguous()
-            if alpha is not None:
-                alpha_up = F.interpolate(
-                    alpha.permute(0, 3, 1, 2),
-                    size=(out_h, out_w),
-                    mode="nearest",
-                ).permute(0, 2, 3, 1)
-                out = torch.cat((out, alpha_up), dim=-1)
-            return (out,)
 
-        if luma_in_ch != 1 or luma_out_ch != 1:
-            raise ArtCNNONNXError(
-                f"Selected model has unsupported channel layout {luma_in_ch}->{luma_out_ch}. "
-                "This node supports 1->1 luma models and 3->3 RGB models."
+            output = (
+                torch.from_numpy(rgb_output_np)
+                .clamp(0, 1)
+                .permute(0, 2, 3, 1)
+                .contiguous()
             )
 
-        _validate_luma(luma_session)
+            if alpha is not None:
+                alpha_up = (
+                    F.interpolate(
+                        alpha.permute(0, 3, 1, 2),
+                        size=(output_height, output_width),
+                        mode="nearest",
+                    )
+                    .permute(0, 2, 3, 1)
+                )
 
-        # Convert to BT.709 YCbCr in NCHW.
+                output = torch.cat(
+                    (output, alpha_up),
+                    dim=-1,
+                )
+
+            return (output,)
+
+        # -----------------------------------------------------------------
+        # Luma 1 -> 1
+        # -----------------------------------------------------------------
+
+        if (
+            model_input_channels != 1
+            or model_output_channels != 1
+        ):
+            raise ArtCNNONNXError(
+                "Selected primary model has unsupported channel layout "
+                f"{model_input_channels}->{model_output_channels}. "
+                "The primary model must be either 1->1 luma or 3->3 RGB."
+            )
+
+        _validate_luma_model(model_session)
+
         ycbcr = _rgb_to_ycbcr(rgb_nchw)
         y = ycbcr[:, 0:1]
-        y_np = y.cpu().numpy().astype(np.float32, copy=False)
-        y2_np = _run_luma(luma_session, y_np)
-        y2 = torch.from_numpy(y2_np)
 
-        in_h, in_w = y.shape[-2:]
-        out_h, out_w = y2.shape[-2:]
-        scale_h = out_h / max(in_h, 1)
-        scale_w = out_w / max(in_w, 1)
-        if abs(scale_h - scale_w) > 1e-6:
+        y_np = (
+            y.cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+
+        luma_output_np = _run_primary_model(
+            model_session,
+            y_np,
+        )
+
+        if (
+            luma_output_np.ndim != 4
+            or luma_output_np.shape[1] != 1
+        ):
             raise ArtCNNONNXError(
-                "Luma ArtCNN model produced a non-uniform scale: "
-                f"Input={in_h}x{in_w}, output={out_h}x{out_w} "
-                f"({scale_w:.3f}x{scale_h:.3f})"
+                "Unexpected luma model output shape: "
+                f"{luma_output_np.shape}"
             )
-        if min(abs(scale_w - 2.0), abs(scale_w - 4.0)) > 1e-6:
+
+        luma_output = torch.from_numpy(luma_output_np)
+
+        input_height, input_width = y.shape[-2:]
+        output_height, output_width = luma_output.shape[-2:]
+
+        scale_height = output_height / max(input_height, 1)
+        scale_width = output_width / max(input_width, 1)
+
+        if abs(scale_height - scale_width) > 1e-6:
+            raise ArtCNNONNXError(
+                "Luma model produced a non-uniform scale: "
+                f"input={input_height}x{input_width}, "
+                f"output={output_height}x{output_width}"
+            )
+
+        if min(
+            abs(scale_width - 2.0),
+            abs(scale_width - 4.0),
+        ) > 1e-6:
             raise ArtCNNONNXError(
                 "This node supports 2x and 4x luma ArtCNN models. "
-                f"Input={in_h}x{in_w}, output={out_h}x{out_w} "
-                f"({scale_w:.3f}x{scale_h:.3f})"
+                f"Input={input_height}x{input_width}, "
+                f"output={output_height}x{output_width} "
+                f"({scale_width:.3f}x)"
             )
 
-        # ArtCNN chroma models explicitly require bilinear chroma pre-upscaling.
-        # When no neural chroma model is selected, allow a conventional resampler.
-        if chroma_session is not None:
-            cbcr_up = _resize_chroma(ycbcr[:, 1:3], (out_h, out_w), "bilinear")
-            chroma_in = torch.cat((y2, cbcr_up), dim=1)
-            chroma_np = chroma_in.cpu().numpy().astype(np.float32, copy=False)
-            chroma2_np = _run_chroma(chroma_session, chroma_np)
-            chroma2 = torch.from_numpy(chroma2_np).clamp(0, 1)
-        else:
-            # For ordinary RGB input there is no subsampled chroma plane to
-            # independently reconstruct.  Build the output chroma from a
-            # spatially upscaled RGB reference at the exact output geometry,
-            # then replace only its Y plane with ArtCNN's result. This keeps
-            # chroma geometrically aligned with the ArtCNN luma and avoids
-            # color casts from independently resampling Cb/Cr.
-            if chroma_resampler.lower() == "bilinear":
-                rgb_up = F.interpolate(
-                    rgb_nchw, size=(out_h, out_w), mode="bilinear", align_corners=False
-                )
-            else:
-                # Reuse the deterministic reconstruction kernels for each RGB
-                # channel. This is slower than bilinear but preserves the
-                # requested filter without converting color planes separately.
-                rgb_up_np = rgb_nchw.detach().cpu().numpy().astype(np.float32, copy=False)
-                rgb_up_np = _resize_axis_np(rgb_up_np, out_h, axis=2, kind=chroma_resampler.lower())
-                rgb_up_np = _resize_axis_np(rgb_up_np, out_w, axis=3, kind=chroma_resampler.lower())
-                rgb_up = torch.from_numpy(rgb_up_np)
-            chroma2 = _rgb_to_ycbcr(rgb_up)[:, 1:3].clamp(0, 1)
+        # -----------------------------------------------------------------
+        # Neural chroma reconstruction
+        # -----------------------------------------------------------------
 
-        out_ycbcr = torch.cat((y2.clamp(0, 1), chroma2), dim=1)
-        out = _ycbcr_to_rgb(out_ycbcr).permute(0, 2, 3, 1).contiguous()
+        if chroma_session is not None:
+            chroma_up = _resize_chroma(
+                ycbcr[:, 1:3],
+                (output_height, output_width),
+                "bilinear",
+            )
+
+            if chroma_up.shape[-2:] != luma_output.shape[-2:]:
+                raise ArtCNNONNXError(
+                    "Luma output and chroma input dimensions do not match: "
+                    f"luma={tuple(luma_output.shape[-2:])}, "
+                    f"chroma={tuple(chroma_up.shape[-2:])}"
+                )
+
+            chroma_input = torch.cat(
+                (luma_output, chroma_up),
+                dim=1,
+            )
+
+            chroma_input_np = (
+                chroma_input.cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
+
+            chroma_output_np = _run_chroma_model(
+                chroma_session,
+                chroma_input_np,
+            )
+
+            chroma_output = (
+                torch.from_numpy(chroma_output_np)
+                .clamp(0, 1)
+            )
+
+        # -----------------------------------------------------------------
+        # Non-neural chroma reconstruction
+        # -----------------------------------------------------------------
+
+        else:
+            chroma_output = _resize_chroma(
+                ycbcr[:, 1:3],
+                (output_height, output_width),
+                chroma_resampler,
+            ).clamp(0, 1)
+
+        # -----------------------------------------------------------------
+        # YCbCr -> RGB
+        # -----------------------------------------------------------------
+
+        output_ycbcr = torch.cat(
+            (
+                luma_output.clamp(0, 1),
+                chroma_output,
+            ),
+            dim=1,
+        )
+
+        output = (
+            _ycbcr_to_rgb(output_ycbcr)
+            .permute(0, 2, 3, 1)
+            .contiguous()
+        )
 
         if alpha is not None:
-            alpha_up = F.interpolate(
-                alpha.permute(0, 3, 1, 2),
-                size=(out_h, out_w),
-                mode="nearest",
-            ).permute(0, 2, 3, 1)
-            out = torch.cat((out, alpha_up), dim=-1)
+            alpha_up = (
+                F.interpolate(
+                    alpha.permute(0, 3, 1, 2),
+                    size=(output_height, output_width),
+                    mode="nearest",
+                )
+                .permute(0, 2, 3, 1)
+            )
 
-        return (out,)
+            output = torch.cat(
+                (output, alpha_up),
+                dim=-1,
+            )
+
+        return (output,)
 
 
 NODE_CLASS_MAPPINGS = {
-    "ArtCNNLumaUpscaleONNX": ArtCNNLumaUpscaleONNX,
+    "ArtCNNUpscaleONNX": ArtCNNUpscaleONNX,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ArtCNNLumaUpscaleONNX": "ArtCNN Luma Upscale (ONNX / DirectML)",
+    "ArtCNNUpscaleONNX": "ArtCNN Upscale (ONNX / DirectML)",
 }
